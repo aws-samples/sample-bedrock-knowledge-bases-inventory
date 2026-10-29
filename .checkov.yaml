@@ -1,0 +1,33 @@
+# Checkov findings accepted for this sample, with the reason for each. cdk-nag (run on every synth, see bin/)
+# covers the same ground; its acknowledgments live in lib/bkb_inventory-stack.ts.
+# Scan: npx cdk synth -o cdk.out && checkov -f cdk.out/BkbInventoryStack.template.json -f app/Dockerfile
+skip-check:
+  # Encryption at rest uses AWS-owned/managed keys (SSE-S3, CloudWatch Logs default, Lambda default).
+  # Customer-managed KMS keys add cost and key administration without protecting anything extra here:
+  # the data is the public NOAA weather set and service logs.
+  - CKV_AWS_158 # CloudWatch log groups with KMS
+  - CKV_AWS_173 # Lambda environment variables with KMS (they hold resource names, no secrets)
+  - CKV_AWS_136 # ECR repository with KMS
+  # Lambdas are deploy-time custom resources plus one scheduled sync; they call AWS APIs and the public
+  # NOAA bucket only, so a VPC adds NAT dependency without isolating anything. Failures surface in
+  # CloudFormation (custom resources) or the function's logs (schedule) rather than in a DLQ, and concurrency
+  # is bounded by the callers (one deploy, one daily rule).
+  - CKV_AWS_117 # Lambda in a VPC
+  - CKV_AWS_116 # Lambda dead-letter queue
+  - CKV_AWS_115 # Lambda reserved concurrency
+  # Buckets hold data that is regenerated on deploy (mirrored weather docs, ACL file) or is append-only
+  # logs with lifecycle expiry; the stack destroys them on delete.
+  - CKV_AWS_21 # S3 versioning
+  # The access-log bucket is the logging destination itself; the other buckets log into it.
+  - CKV_AWS_18 # S3 access logging
+  # The image tag is the app/ content hash and only that tag is deployed; a rebuild of the same content
+  # re-pushes the same tag, which immutable tags would reject.
+  - CKV_AWS_51 # ECR immutable tags
+  # The ALB is internal (no public subnets, ingress only from the VPC CIDR) and is reached only through an
+  # IAM-authenticated, TLS-encrypted SSM port-forwarding session (scripts/tunnel.sh). There is no domain to
+  # issue a certificate for.
+  - CKV_AWS_2 # ALB listener HTTPS
+  - CKV_AWS_103 # ALB listener TLS 1.2
+  # Step Functions log delivery for the provider-framework waiter: logs:PutResourcePolicy and the
+  # *LogDelivery APIs have no resource-level scoping (CDK-generated policy).
+  - CKV_AWS_111 # IAM write without constraints

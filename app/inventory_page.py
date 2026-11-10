@@ -153,14 +153,33 @@ with tab_activity:
     st.dataframe(milestones.dropna(axis=1, how="all"), width="stretch", hide_index=True)
 
 with tab_events:
+    jobs = ingestion_jobs()
+    picked_jobs: list[str] = []
+    if not jobs.empty:
+        st.caption("Click rows to show only those ingestion jobs' events (none selected = all jobs).")
+        jobs_view = jobs[[c for c in ["ingestion_job_id", "data_source_id", "status", "started_at", "description",
+                                      "numberOfDocumentsScanned", "numberOfNewDocumentsIndexed",
+                                      "numberOfModifiedDocumentsIndexed", "numberOfDocumentsDeleted",
+                                      "numberOfDocumentsFailed"] if c in jobs.columns]]
+        sel = st.dataframe(jobs_view, width="stretch", hide_index=True, key="events_job_picker",
+                           on_select="rerun", selection_mode="multi-row")
+        # Job IDs come from ListIngestionJobs (10-char alphanumeric); the check keeps the inlined SQL literal safe.
+        picked_jobs = [j for j in jobs_view.iloc[sel.selection.rows]["ingestion_job_id"]
+                       if isinstance(j, str) and j.isalnum()]
+    # Filter jobs in SQL so older jobs' events aren't cut off by the row limit.
+    job_filter = ("WHERE ingestion_job_id IN (" + ", ".join(f"'{j}'" for j in picked_jobs) + ") "
+                  if picked_jobs else "")
     ev = query("SELECT ts, level, event_type, data_source_id, ingestion_job_id, document_id, source_uri, "
                "hashed_document_id, crawl_action, crawl_status, index_status, sync_status, connector_status, status, "
                "status_reasons, chunks_created "
-               "FROM kb_logs ORDER BY ts DESC LIMIT 5000")
+               f"FROM kb_logs {job_filter}ORDER BY ts DESC LIMIT 5000")  # nosec B608
     if not ev.empty:
-        lv = st.multiselect("Level", sorted(ev["level"].dropna().unique()), default=None)
-        if lv:
-            ev = ev[ev["level"].isin(lv)]
+        f1, f2, f3 = st.columns(3)
+        for col, field, label in [(f1, "level", "Level"), (f2, "event_type", "Event type"), (f3, "status", "Status")]:
+            vals = col.multiselect(label, sorted(ev[field].dropna().unique()), default=None, key=f"events_{field}")
+            if vals:
+                ev = ev[ev[field].isin(vals)]
+    st.caption(f"{len(ev)} events" + (f" for job(s) {', '.join(picked_jobs)}" if picked_jobs else ""))
     st.dataframe(ev, width="stretch", hide_index=True)
 
 with tab_sql:

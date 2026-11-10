@@ -135,12 +135,18 @@ def duck() -> duckdb.DuckDBPyConnection:
             sync_status,
             connector_status,
             -- Managed KBs report per-stage SUCCESS/FAILED (connector_document_status is the consolidated one);
-            -- map them onto the vector-KB document statuses.
+            -- map them onto the vector-KB document statuses. Deletions may only carry a crawl/index stage
+            -- status (or none), so a DELETE that didn't fail counts as DELETED; otherwise it'd be NULL and
+            -- vanish from Activity.
             COALESCE(event ->> 'status', CASE
-                WHEN COALESCE(connector_status, sync_status) = 'SUCCESS'
-                    THEN CASE WHEN event ->> 'crawl_action' = 'DELETE' THEN 'DELETED' ELSE 'INDEXED' END
-                WHEN event ->> 'error_message' IS NOT NULL OR COALESCE(connector_status, sync_status) = 'FAILED'
+                WHEN event ->> 'error_message' IS NOT NULL
+                    OR 'FAILED' IN (connector_status, sync_status, event ->> '$.crawl_status.Status',
+                                    event ->> '$.index_status.Status')
                     OR (is_document_event AND level = 'ERROR') THEN 'FAILED'
+                WHEN event ->> 'crawl_action' = 'DELETE'
+                    AND COALESCE(connector_status, sync_status, event ->> '$.index_status.Status',
+                                 event ->> '$.crawl_status.Status', 'SUCCESS') = 'SUCCESS' THEN 'DELETED'
+                WHEN COALESCE(connector_status, sync_status) = 'SUCCESS' THEN 'INDEXED'
                 ELSE COALESCE(connector_status, sync_status) END)       AS status,
             -- Some document events carry only a `message`; that's a reason, not a job status.
             COALESCE(event ->> 'ingestion_job_status',

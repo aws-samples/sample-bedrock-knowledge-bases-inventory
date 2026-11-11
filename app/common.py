@@ -34,6 +34,9 @@ DATA_SOURCE_ID = os.environ["DATA_SOURCE_ID"]
 DATA_BUCKET = os.environ["DATA_BUCKET"]
 DATA_PREFIX = os.environ.get("DATA_PREFIX", "")
 LOG_BUCKET = os.environ["LOG_BUCKET"]
+# Off by default: the inventory is built from the KB logs and the Bedrock APIs only, without reading the source
+# buckets. On, it also lists every S3 data source (ListObjectsV2) for file sizes and NOT_CONSUMED / NOT_IN_SOURCE.
+SOURCE_LISTING = os.environ.get("SOURCE_LISTING", "false").lower() == "true"
 FAILED_STATUSES = ["FAILED", "FAILURE", "EMBEDDING_FAILED", "INDEXING_FAILED", "DELETION_FAILED", "METADATA_UPDATE_FAILED"]
 # Only this KB's logs: vended logs land under AWSLogs/<acct>/bedrock/knowledgebases/<region>/<kbId>/yyyy/MM/dd/HH/,
 # and a replaced KB leaves its old logs behind. Override for local dev, e.g. LOG_GLOB=./sample-logs/**/*.log.gz
@@ -129,6 +132,8 @@ def duck() -> duckdb.DuckDBPyConnection:
             COALESCE(event ->> '$.document_location.type', event ->> 'content_type') AS content_type,
             event ->> 'hashed_document_id'                               AS hashed_document_id,
             event ->> 'document_title'                                   AS document_title,
+            -- The source's own last-modified time as the connector saw it (managed KBs).
+            TRY_CAST(event ->> '$.metadata._last_updated_at' AS TIMESTAMPTZ) AS source_updated_at,
             event ->> 'crawl_action'                                     AS crawl_action,
             event ->> '$.crawl_status.Status'                            AS crawl_status,
             event ->> '$.index_status.Status'                            AS index_status,
@@ -285,8 +290,17 @@ def data_sources() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
-@st.cache_data(ttl=60)
 def source_listings() -> tuple[pd.DataFrame, list[str]]:
+    """The inventory's view of the sources: the S3 listing when SOURCE_LISTING is on, otherwise nothing, so the
+    inventory never reads the data sources' buckets. Returns (objects, sources that were not listed)."""
+    if SOURCE_LISTING:
+        return list_s3_sources()
+    return (pd.DataFrame(columns=["uri", "data_source_id", "size_mb", "last_modified"]),
+            list(data_sources()["data_source_id"]))
+
+
+@st.cache_data(ttl=60)
+def list_s3_sources() -> tuple[pd.DataFrame, list[str]]:
     """List the objects of every S3 data source. Returns (objects, sources that could not be listed).
 
     Only S3 can be listed with the task role; SaaS connectors (SharePoint, ServiceNow, ...) have no listing,
@@ -356,6 +370,7 @@ def inventory() -> pd.DataFrame:
                arg_max(data_source_id, ts) AS data_source_id,
                arg_max(source_uri, ts) FILTER (WHERE source_uri IS NOT NULL) AS source_uri,
                arg_max(document_title, ts) FILTER (WHERE document_title IS NOT NULL) AS document_title,
+               arg_max(source_updated_at, ts) FILTER (WHERE source_updated_at IS NOT NULL) AS source_updated_at,
                arg_max(hashed_document_id, ts) FILTER (WHERE hashed_document_id IS NOT NULL) AS hashed_document_id,
                arg_max(status_reasons, ts) FILTER (WHERE status_reasons IS NOT NULL) AS last_reasons,
                max(chunks_created) FILTER (WHERE status IN ('INDEXED', 'PARTIALLY_INDEXED')) AS chunks_created,
@@ -364,7 +379,7 @@ def inventory() -> pd.DataFrame:
     """)
     if latest.empty:
         latest = pd.DataFrame(columns=["uri", "last_log_status", "last_log_at", "data_source_id", "source_uri",
-                                       "document_title", "hashed_document_id", "last_reasons", "chunks_created",
+                                       "document_title", "source_updated_at", "hashed_document_id", "last_reasons", "chunks_created",
                                        "jobs_seen"])
 
     # Outer joins: a doc can be in S3 but never ingested, or only in logs (e.g. ignored, or since deleted from S3).
@@ -375,6 +390,9 @@ def inventory() -> pd.DataFrame:
         inv.pop("data_source_id_log"))
     ds = data_sources()
     inv = inv.merge(ds[["data_source_id", "data_source_name", "source_type"]], on="data_source_id", how="left")
+    # The S3 listing's time when listed, otherwise the source time the connector logged.
+    inv["last_modified"] = pd.to_datetime(inv["last_modified"], utc=True).fillna(
+        pd.to_datetime(inv.pop("source_updated_at"), utc=True))
     inv["consumed"] = inv["kb_status"].eq("INDEXED")
     inv["in_source"] = inv["size_mb"].notna()
     # Listable = we know the full source contents (S3 sources the task role can read).
@@ -422,7 +440,8 @@ def station_names() -> dict[str, str]:
     """document_id -> "station NAME (year)". The NAME comes from the first data row of one CSV per station
     (a 2 KB range read); the year from its noaa-gsod-<year>/ partition."""
     names, by_station = {}, {}
-    listed, _ = source_listings()
+    # Labels for the search and chat pages; the inventory page doesn't use them, so it never reads the documents.
+    listed, _ = list_s3_sources()
     for uri in listed["uri"]:
         if uri.endswith(".csv"):
             by_station.setdefault(uri.rsplit("/", 1)[-1], []).append(uri)

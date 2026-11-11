@@ -10,11 +10,12 @@ SaaS sources (SharePoint, ServiceNow, ...) can't be listed, so their rows come f
 import pandas as pd
 import streamlit as st
 
-from common import (FAILED_STATUSES, KB_ID, LOG_BUCKET, data_sources, ingestion_jobs, inventory, query, source_listings,
-                    station_names, user_query)
+from common import (FAILED_STATUSES, KB_ID, LOG_BUCKET, SOURCE_LISTING, data_sources, ingestion_jobs, inventory, query,
+                    source_listings, user_query)
 
 st.title("Bedrock Knowledge Base inventory")
-st.caption(f"KB `{KB_ID}` / logs `s3://{LOG_BUCKET}`")
+st.caption(f"KB `{KB_ID}` / logs `s3://{LOG_BUCKET}`"
+           + ("" if SOURCE_LISTING else " / built from the KB logs and Bedrock APIs only; source buckets aren't read"))
 
 # Read-only: the task role can't start syncs. Ingestion runs from `cdk deploy` (weather or ACL changes) and the
 # weather-sync schedule (only when the mirrored data changes).
@@ -27,16 +28,23 @@ _, unlisted = source_listings()
 with st.expander(f"Data sources ({len(ds)})"):
     st.dataframe(ds.assign(listed=~ds["data_source_id"].isin(unlisted) & ds["bucket"].notna()),
                  width="stretch", hide_index=True)
-    if unlisted:
+    if not SOURCE_LISTING:
+        st.caption("Source listing is off (`SOURCE_LISTING`), so rows come from the KB logs and "
+                   "ListKnowledgeBaseDocuments only: no file sizes and no NOT_CONSUMED / NOT_IN_SOURCE rows.")
+    elif unlisted:
         st.caption("Unlisted sources (SaaS connectors, or S3 buckets the task role can't read) show only what the "
                    "KB API and logs know about: no NOT_CONSUMED / NOT_IN_SOURCE rows.")
 
 # Current-state metrics. Chunk counts only exist in vector-KB logs; managed KBs don't log them.
-metrics = [
-    ("Objects in listed sources", int(inv["in_source"].sum())),
-    ("Indexed in KB", int(inv["consumed"].sum())),
-    ("Not consumed", int((inv["in_source"] & ~inv["consumed"]).sum())),
-    ("Not in source", int((inv["listable"] & ~inv["in_source"]).sum())),
+metrics = [("Indexed in KB", int(inv["consumed"].sum()))]
+if SOURCE_LISTING:
+    metrics = [("Objects in listed sources", int(inv["in_source"].sum())), *metrics,
+               ("Not consumed", int((inv["in_source"] & ~inv["consumed"]).sum())),
+               ("Not in source", int((inv["listable"] & ~inv["in_source"]).sum()))]
+else:
+    metrics = [("Documents known (KB + logs)", len(inv)), *metrics,
+               ("Deleted (logs)", int((inv["last_log_status"].eq("DELETED") & ~inv["consumed"]).sum()))]
+metrics += [
     ("Failed / ignored (logs)", int(inv["last_log_status"].isin(FAILED_STATUSES + ["RESOURCE_IGNORED"]).sum())),
     ("Docs cited in chat", int((inv["times_cited"] > 0).sum())),
 ]
@@ -57,12 +65,13 @@ with tab_inv:
     df.loc[df["last_log_status"].isin(["RESOURCE_IGNORED"]), "state"] = "IGNORED"
     df.loc[df["kb_status"].eq("FAILED") | df["last_log_status"].isin(FAILED_STATUSES), "state"] = "FAILED"
     df.loc[df["kb_status"].isin(["PENDING", "STARTING", "IN_PROGRESS"]), "state"] = "IN_PROGRESS"
+    df.loc[df["last_log_status"].eq("DELETED"), "state"] = "DELETED"
     df.loc[df["consumed"], "state"] = "INDEXED"
     df.loc[df["listable"] & ~df["in_source"], "state"] = "NOT_IN_SOURCE"  # KB/log only: since deleted from S3
     # Weather docs are partitioned as noaa-gsod-<year>/<station>.csv; other documents have no year or station.
     df["year"] = df["key"].str.extract(r"noaa-gsod-(\d{4})/", expand=False)
-    names = station_names()
-    df["station"] = df["uri"].map(names).str.replace(r" \(\d{4}\)$", "", regex=True)
+    # Station ID from the key, so the page never reads the documents themselves.
+    df["station"] = df["key"].str.extract(r"noaa-gsod-\d{4}/([^/]+)\.csv$", expand=False)
 
     # ---- filters
     f1, f2, f3, f4, f5 = st.columns([3, 2, 2, 2, 2])
@@ -99,9 +108,10 @@ with tab_inv:
     p3.caption(f"{len(df):,} files match; page {page} of {pages}")
     st.dataframe(
         df.iloc[(page - 1) * page_size: page * page_size][
-            ["uri", "year", "station", "state", "data_source_name", "source_type", "size_mb", "last_modified",
-             "kb_status", "kb_updated_at", "last_log_at", "jobs_seen", "times_cited", "last_cited_at",
-             "last_reasons", "kb_status_reason", "source_uri"]],
+            ["uri", "year", "station", "state", "data_source_name", "source_type"]
+            + (["size_mb"] if SOURCE_LISTING else [])
+            + ["last_modified", "kb_status", "kb_updated_at", "last_log_at", "jobs_seen", "times_cited",
+               "last_cited_at", "last_reasons", "kb_status_reason", "source_uri"]],
         width="stretch", hide_index=True,
         # document_id (s3:// URI for S3) is what CheckIngestedDocumentAcl / GetIngestedDocumentAcl expect.
         column_config={"uri": st.column_config.TextColumn("document_id"),

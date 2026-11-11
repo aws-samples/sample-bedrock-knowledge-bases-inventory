@@ -61,6 +61,12 @@ export interface BkbInventoryStackProps extends cdk.StackProps {
    * Default: daily. Pass `null` to sync only on deploy.
    */
   readonly weatherSyncSchedule?: events.Schedule | null;
+  /**
+   * Let the inventory page list the S3 data sources (ListObjectsV2) for file sizes and documents that are in the
+   * source but not in the knowledge base. Default: false (or the `sourceListing` context), so the inventory is
+   * built from the knowledge base logs and Bedrock APIs only.
+   */
+  readonly sourceListing?: boolean;
 }
 
 const APP_DIR = path.join(__dirname, '..', 'app');
@@ -555,6 +561,7 @@ exports.handler = async (event) => {
           ACL_DEFAULT_USER: documentAcls.find(a => a.allow.length)?.allow[0] ?? '',
           LOG_BUCKET: logBucket.bucketName,
           LOG_GROUP: kbLogGroup.logGroupName,
+          SOURCE_LISTING: String(props.sourceListing ?? String(this.node.tryGetContext('sourceListing')) === 'true'),
           CHAT_MODELS: chatModelIds.join(','),
           // Expected verdicts for the ACL check page (the task role can't read acl/ itself).
           DOCUMENT_ACLS: JSON.stringify(documentAcls),

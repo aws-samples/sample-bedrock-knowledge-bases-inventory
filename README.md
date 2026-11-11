@@ -105,8 +105,8 @@ A Streamlit multipage app in one container. Every page sends the sidebar's **Ask
 | Agentic search | `AgenticRetrieveStream` | A live trace (planning, sub-queries, full-document expansions) and a streamed answer whose `[n]` citation marks point into the results table |
 | Retrieval instructions | `AgenticRetrieveStream` with `retrievalInstructionConfiguration` | Pick a persona, see its fields and review status, and run a demo question side by side with and without the instruction. The second demo question is one the persona's answer policy should decline or redirect |
 | ACL check | `GetDocumentContent` with `userContext` | A documents-by-users matrix of ALLOW / DENY / NOT_FOUND / ERROR, compared with the verdict the stack's ACL predicts, with CSV download. A run where no expected ALLOW returns ALLOW is marked invalid |
-| Weather chat | `Converse` with `Retrieve` as a tool | A Claude agent that cites the chunks it used, with each cited document's ingestion history |
-| Inventory | S3 and knowledge base APIs, DuckDB over the logs | What the knowledge base has ingested, see below |
+| Weather chat | `ConverseStream` with `Retrieve` as a tool | A Claude agent that cites the chunks it used, with each cited document's ingestion history |
+| Inventory | DuckDB over the knowledge base logs, knowledge base APIs, and optionally S3 listing | What the knowledge base has ingested, see below |
 
 Agentic search and the instruction page use `foundationModelType: MANAGED`, so Bedrock picks the planning model. That model is invoked with the caller's credentials, so the task role has `bedrock:InvokeModelWithResponseStream` on `*`, as described in the [Bedrock User Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-test-agentic-retrieve.html#kb-agentic-retrieve-permissions).
 
@@ -114,60 +114,81 @@ The retrieval instructions page runs the same question with and without a person
 
 ![Retrieval instructions page: baseline answer next to the answer with the "Sunny, the TV forecaster" instruction applied](images/retrieval-instructions.png)
 
-Station names come from the `NAME` column of each CSV file, read with a 2 KB range request and cached for an hour. The ACL check only knows the global ACL file, not per-document `.metadata.json` overrides.
+On the search, ACL check and chat pages, station names come from the `NAME` column of each CSV file, read with a 2 KB range request and cached for an hour. The inventory page shows the station ID from the object key instead, so it doesn't read the documents. The ACL check only knows the global ACL file, not per-document `.metadata.json` overrides.
 
 ### Weather chat
 
 Claude on Bedrock (the `ConverseStream` API) with one tool, `search_knowledge_base`, backed by the knowledge base `Retrieve` API and filtered by the sidebar user's ACLs. The model decides when and what to search, can search several times per question, and cites retrieved chunks inline as `[S1]`, `[S2]` and so on.
 
-- **Sources**: each answer lists the chunks it cited (station, score, text), joined to the inventory: knowledge base status, chunk count, last ingestion time and how often the document has been cited.
+- **Sources**: each answer lists the chunks it cited (station, score, text), joined to the inventory: knowledge base status, last ingestion time, how often the document has been cited and, where the logs record it (vector knowledge bases), the chunk count.
 - **Citation events**: the citations of every answer are written as JSON Lines to `s3://<log bucket>/app/citations/dt=YYYY-MM-DD/`. DuckDB reads them back as the `kb_citations` view, so the inventory shows how often each document was used in answers, in addition to whether it was ingested. Each event holds the question and the **Ask as** address, so a lifecycle rule deletes them after 90 days; the knowledge base logs under `AWSLogs/` are kept as the ingestion history.
 - **Models**: a sidebar picker over the cross-Region inference profiles in the `chatModelIds` stack prop. The `bedrock:InvokeModel` grant is scoped to those profiles, but agentic retrieval needs `bedrock:InvokeModelWithResponseStream` on `*` (see above), so the task role can stream any model the account has access to. See [Security](#security).
 - `RetrieveAndGenerate` isn't used because it requires custom orchestration and generation prompt templates for Claude 5 models. `Retrieve` plus `Converse` with tool use gives more control.
 
 ### Inventory
 
-- **Inventory**: search by key, filter by state and group files per day (UTC), by S3 last-modified time or last knowledge base activity. A per-day chart and table, a paginated file list and CSV export of the filtered set. Each row combines three sources, keyed by document ID:
-  1. `ListObjectsV2` on the data bucket: what *should* be in the knowledge base
-  2. `ListKnowledgeBaseDocuments`: what the knowledge base says it has now (`INDEXED`, `FAILED`, ...)
-  3. the knowledge base logs, through DuckDB: the latest status per document, ignore and failure reasons, and how many ingestion jobs touched it
+The inventory answers two questions: what is in the knowledge base now, and what each ingestion job did. It is built from what the knowledge base itself reports, without reading the source buckets. Each document is keyed by its document ID and combines:
 
-  This surfaces documents that are in S3 but were never ingested, and documents that were ignored and only show up in the logs. It covers **every data source of the knowledge base**, see [Other data sources](#other-data-sources).
+1. The knowledge base logs in the log bucket, read with DuckDB: the latest status per document (including deletions), ignore and failure reasons, the source's last-modified time as the connector saw it, and how many ingestion jobs processed it
+2. `ListKnowledgeBaseDocuments`: what the knowledge base says it has now (`INDEXED`, `FAILED`, ...)
+3. Optionally, `ListObjectsV2` on each S3 data source, see [Source listing](#source-listing)
 
-  ![Inventory page: documents per year partition by state, and the paginated file list](images/inventory.png)
-- **Ingestion jobs**: from `ListIngestionJobs` and the `StartIngestionJob.StatusChanged` log events.
-- **Log events**: the raw event timeline.
+This surfaces documents that were ignored or failed and only show up in the logs, and documents that were deleted. It covers **every data source of the knowledge base**; see [Other data sources](#other-data-sources) for what changes with connectors other than S3.
+
+The top of the page shows counts: documents known to the knowledge base and its logs, indexed, deleted, failed or ignored, and cited in chat. Below that are four tabs:
+
+- **Inventory**: current state, one row per document. Search by key and filter by state, data source, year and station ID. A chart and table of documents per year partition, a paginated file list and a CSV export of the filtered set.
+
+  ![Inventory page with source listing on: documents per year partition by state, and the paginated file list](images/inventory.png)
+
+  The screenshot was taken with [source listing](#source-listing) on, which adds the listing counts and the `size_mb` column. Without it, the counts are documents known, indexed, deleted, failed or ignored, and cited in chat.
+- **Activity**: history. Documents processed per day by logged status (for example `INDEXED` or `DELETED`), filterable by date range and ingestion job, followed by the jobs from `ListIngestionJobs` and their `StartIngestionJob.StatusChanged` milestones from the logs.
+- **Log events**: the raw event timeline. Select one or more ingestion jobs in the table at the top to see only their events, and filter by level, event type and status. For example, select a job and the status `DELETED` to see which documents that job removed.
 - **SQL**: read-only DuckDB SQL over the `kb_logs`, `kb_logs_raw` and `kb_citations` views. Only `SELECT` (including `WITH`, `DESCRIBE` and `SUMMARIZE`) and `EXPLAIN` statements run, checked with DuckDB's parser, so `COPY ... TO`, `EXPORT`, `ATTACH`, `CREATE` and `SET` are refused. The connection is also sandboxed: it can only reach the knowledge base log and citation prefixes in the log bucket. Local files, HTTP, other S3 locations, installing extensions and changing settings are blocked.
 
 The app is read-only for the knowledge base: it can't start syncs. Ingestion runs from `cdk deploy` (when the documents or ACLs change) and from the `WeatherSync` schedule (when the source files change).
 
+#### Source listing
+
+The logs only know about documents the connector saw. A document that was never picked up, for example one with no ACL entry, doesn't appear in them. To find those, and to show file sizes, deploy with `./scripts/deploy.sh -c sourceListing=true` (or set the `sourceListing` stack prop). The inventory then also lists every S3 data source with `ListObjectsV2` and adds:
+
+- the counts of objects in the listed sources, objects not consumed (`NOT_CONSUMED`) and documents no longer in the source (`NOT_IN_SOURCE`)
+- a `size_mb` column, and the last-modified time from the listing
+
+Listing reads the source buckets, needs `s3:ListBucket` on each of them, and makes one request per 1,000 objects, at most once a minute while the page is in use. It is off by default.
+
 ## Other data sources
 
-The app is connector-agnostic. It discovers the knowledge base's data sources with `ListDataSources` and `GetDataSource` and inventories all of them, so adding a SharePoint, ServiceNow, Confluence, web crawler or other connector to the knowledge base is enough. The stack itself only creates the S3 data source.
+The stack only creates an S3 data source, but the app works with any connector. It discovers the knowledge base's data sources with `ListDataSources` and `GetDataSource` and inventories all of them, so adding a SharePoint, ServiceNow, Confluence, web crawler or other data source to the knowledge base is enough. To set up connectors such as SharePoint, OneDrive, Confluence or Google Drive for a managed knowledge base, see [KB Connector Helper](https://github.com/aws-samples/sample-managed-kb-connector-setup).
+
+What differs between connectors:
 
 - **Logs**: the vended log envelope (`event_timestamp`, `event_type`, `level`, `event`) is the same for every connector. Managed knowledge bases log a connector-independent document event with `document_id`, `source_uri`, `content_type`, per-stage statuses and `connector_document_status` ([documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-managed-observability.html)). Vector knowledge bases nest the location per connector instead (`document_location.s3_location.uri`, `web_location.url`, ...). The `kb_logs` view handles both.
-- **Key**: rows are keyed by `document_id` (an `s3://` URI for S3, the connector's ID otherwise). `Retrieve` returns the document's `source_uri` as its location, so chat citations are mapped back to `document_id` through the logs.
-- **Source listing**: only S3 data sources can be listed, and the task role can only read `docs/` in its own bucket; grant read access to other buckets to list them too. SaaS sources such as SharePoint and ServiceNow have no listing, so their rows come from `ListKnowledgeBaseDocuments` and the logs only. They show `INDEXED`, `FAILED` or `IGNORED` with reasons and citations, but never `NOT_CONSUMED` or `NOT_IN_SOURCE`.
+- **Document ID**: an `s3://` URI for S3, the connector's own ID otherwise. `Retrieve` returns the document's `source_uri` as its location, so chat citations are mapped back to the document ID through the logs.
+- **Source listing**: when [source listing](#source-listing) is on, only S3 data sources are listed. The task role can only read `docs/` in its own bucket, so grant it read access to any other bucket you want listed. SaaS sources such as SharePoint and ServiceNow are never listed, so their rows always come from `ListKnowledgeBaseDocuments` and the logs only.
+- **File sizes**: at the time of writing, neither the knowledge base application logs nor `ListKnowledgeBaseDocuments` include a document's size. The log delivery's field selection only chooses which top-level fields are written, so it can't add one. The `size_mb` column therefore needs source listing, and is only available for S3 sources.
+
+  This sample doesn't collect sizes from other connectors. If you need them, add a listing for that connector to `list_s3_sources()` in [`app/common.py`](app/common.py), or a function like it. Use the source system's own API with read-only credentials granted for that purpose, and key the rows by the same document ID the knowledge base logs. A listing also enables `NOT_CONSUMED` and `NOT_IN_SOURCE` for that source.
 - **ACLs**: `userContext` works the same for every connector. SharePoint ACLs need `ENTRA_ID_APP_ONLY` authentication, and ServiceNow ACLs enforce its user criteria.
 
 ## Design notes
 
 **S3 and CloudWatch Logs for the knowledge base logs.** Both are deployed, for different needs:
 
-- S3 is the copy for analysis. Delivery to S3 costs less than CloudWatch Logs ingestion, and DuckDB reads the files in place. Knowledge base logs can be delivered to S3 as `plain`, `json` or `w3c`, not Parquet. The key layout is `AWSLogs/<account>/bedrock/knowledgebases/<region>/<knowledgeBaseId>/{yyyy}/{MM}/{dd}/{HH}/`, and DuckDB reads only the current knowledge base's prefix, because a replaced knowledge base leaves its old logs behind. Managed knowledge base document events carry `document_id` (the `s3://` URI), `hashed_document_id`, `document_title`, `crawl_action` and the per-stage `crawl_status`, `index_status` and `sync_status`. The `kb_logs` view maps them onto document statuses (for example `sync_status = SUCCESS` → `INDEXED`).
+- S3 is the copy for analysis. Delivery to S3 costs less than CloudWatch Logs ingestion, and DuckDB reads the files in place. Knowledge base logs can be delivered to S3 as `plain`, `json` or `w3c`, not Parquet. The key layout is `AWSLogs/<account>/bedrock/knowledgebases/<region>/<knowledgeBaseId>/{yyyy}/{MM}/{dd}/{HH}/`, and DuckDB reads only the current knowledge base's prefix, because a replaced knowledge base leaves its old logs behind. Managed knowledge bases report a status per stage (`crawl_status`, `index_status`, `sync_status`, `connector_document_status`) plus a `crawl_action`. The `kb_logs` view maps these onto one document status: a successful stage becomes `INDEXED`, or `DELETED` when the action is `DELETE`, and a failed stage becomes `FAILED`.
 - CloudWatch Logs is the operational copy: Logs Insights for debugging (`filter event.status = "RESOURCE_IGNORED"`) and metric filters or alarms on `level = "ERROR"`. Retention is one month. If cost matters, this is the one to drop.
 
 **DuckDB.** Logs are only written during ingestion jobs (roughly one event per document state change), so even thousands of documents produce little data. DuckDB scans the gzipped JSON files directly, with no AWS Glue or Amazon Athena setup. The `event` column is read as `JSON` because job-level and document-level events have different shapes. Credentials come from the task role and are passed to DuckDB as a secret on every query, so role credential rotation is handled. For much larger volumes, compact the logs to Parquet on a schedule or use Athena.
 
-**Logs are history, not state.** The authoritative list of what is indexed now is `ListKnowledgeBaseDocuments`. The logs add why (ignore reasons) and when. The inventory uses both.
+**Logs are history, not state.** The authoritative list of what is indexed now is `ListKnowledgeBaseDocuments`. The logs add why (ignore reasons) and when. The inventory uses both. The stack keeps the knowledge base logs under `AWSLogs/` with no expiry, because the history (including when each document was deleted) is rebuilt from them on every page load. For this sample, analytics straight from S3 is enough. For a production inventory, consider writing each document's latest state to a persistent store such as Amazon DynamoDB as log files arrive, so the current state doesn't depend on keeping and rescanning every log file.
 
-**Scale.** The inventory loads the full S3 listing and knowledge base document list into memory, which works up to roughly 100,000 files, and DuckDB scans the full log history for the latest status per document. Beyond that, compact the logs to Parquet daily and keep a materialized latest-status table.
+**Scale.** The inventory loads the knowledge base document list (and, with source listing on, the S3 listing) into memory, and DuckDB scans the full log history for the latest status per document. Results are cached for a minute. This works up to roughly 100,000 files. Beyond that, compact the logs to Parquet daily and keep a materialized latest-status table, and if you use source listing, read the file list from an [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) report instead.
 
 ## Security
 
 - **No internet exposure.** The load balancer is internal and the tasks run in private subnets without public IP addresses. The only way in is a Session Manager session, so access is limited to IAM principals allowed `ecs:ExecuteCommand` and `ssm:StartSession` on the task. The tunnel is encrypted by Session Manager; the load balancer listener itself is HTTP inside the VPC.
 - **No authentication in the app.** Everyone who can open the tunnel has the same access, and the **Ask as** field is not an identity. Before sharing the app with users who should only see their own documents, put authentication in front of it (for example Application Load Balancer authentication with Amazon Cognito or your OIDC identity provider) and derive the `userContext` from the authenticated identity.
-- **Least privilege.** The app's task role can list and retrieve from this knowledge base, apply the stack's own retrieval instructions, read `docs/` in the data bucket and the log and citation prefixes in the log bucket, and write only chat citations. It can't start ingestion jobs or read the ACL file.
+- **Least privilege.** The app's task role can list and retrieve from this knowledge base, apply the stack's own retrieval instructions, read `docs/` in the data bucket (for station names on the search, ACL check and chat pages, and for source listing when it's on) and the log and citation prefixes in the log bucket, and write only chat citations. It can't start ingestion jobs or read the ACL file.
 - **Model invocation.** Because agentic retrieval needs `bedrock:InvokeModelWithResponseStream` on `*`, the task role, and anyone allowed to open the tunnel or use ECS Exec on the task, can stream any Bedrock model the account has access to, not only the `chatModelIds` profiles. Bound the cost with an [AWS Budgets](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) budget on Amazon Bedrock or a CloudWatch alarm on the `AWS/Bedrock` invocation and token metrics, and limit who can start a Session Manager session.
 - **Container.** The app runs as an unprivileged user, and ECR scans the image on push.
 - **Model output.** Answers are rendered as Markdown (raw HTML is not rendered). With the sample's numeric NOAA data that is safe, but a document from an untrusted source could carry instructions that make the model emit Markdown links or images; an image is fetched by the browser and could send text to an external URL. Before connecting untrusted sources, add [Amazon Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html) (for example prompt-attack filters) to the chat and agentic calls, and strip or neutralize links and images in model output.
@@ -180,6 +201,7 @@ The app is connector-agnostic. It discovers the knowledge base's data sources wi
 cd app && pip install -r requirements.txt && python -c "import duckdb; duckdb.sql('INSTALL httpfs')"
 AWS_REGION=us-east-1 KB_ID=... DATA_SOURCE_ID=... DATA_BUCKET=... LOG_BUCKET=... streamlit run app.py
 # LOG_GLOB='./sample-logs/**/*.log.gz' reads local log files instead of S3
+# SOURCE_LISTING=true also lists the S3 data sources on the inventory page
 ```
 
 Run the CDK unit tests with `npm test`.
